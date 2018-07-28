@@ -108,6 +108,7 @@ class TrioHTTPWrapper:
         ]
 
     def info(self, *args):
+        return
         # Little debugging method
         logging.debug("{}: {}".format(self._obj_id,
             ' '.join('%s' for i in range(len(args)))), *args)
