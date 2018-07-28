@@ -18,6 +18,8 @@ class App():
 
 
 if __name__ == '__main__':
+    # The above can be used using the ASGI-compatible cli,
+    # or we can run in programatically:
     import trio
     from trio_web import serve_tcp as serve_http  # todo: why is it called serve_tcp
     trio.run(serve_http, App, 'localhost', 8000)
