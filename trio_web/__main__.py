@@ -1,3 +1,9 @@
+"""
+CLI
+
+Inspired / partly copied from Hypercorn's CLI implementation. 
+"""
+
 import sys
 import argparse
 from pathlib import Path
