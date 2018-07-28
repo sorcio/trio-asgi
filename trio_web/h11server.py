@@ -192,26 +192,26 @@ async def h11_serve_asgi(application, sock):
             'method': event.method.decode('ascii').upper(),
             'scheme': 'http',
             'path': event.target.decode('utf-8'),
-            'query_string': '',
+            'query_string': b'',
             'root_path': '',
             'headers': event.headers,
-            'client': None,
-            'server': None,
+            # 'client': None,
+            # 'server': None,
         }
         application_instance = application(scope)
         request_received = False
         send_headers = wrapper.basic_headers()
         send_status = None
         headers_sent = False
+        chunked = False
 
         async def receive():
             nonlocal request_received
             if request_received:
-                # or maybe we should throw an exception?
-                while True:
-                    await trio.sleep(60)
+                raise ValueError('request was already received')
             event = await wrapper.next_event()
             if type(event) is h11.EndOfMessage:
+                request_received = True
                 return {
                     'type': 'http.request',
                     'body': b'',
@@ -232,15 +232,17 @@ async def h11_serve_asgi(application, sock):
                 send_status = evt['status']
                 send_headers.extend(evt['headers'])
             elif evt['type'] == 'http.response.body':
+                nonlocal headers_sent, chunked
                 body = evt.get('body', b'')
                 more_body = evt.get('more_body', False)
-                if more_body:
-                    raise NotImplementedError('chunking not implemented')
+                chunked |= more_body
                 if not headers_sent:
                     content_length = len(body)
-                    send_headers.append(('content-length', str(content_length)))
+                    if not chunked:
+                        send_headers.append(('content-length', str(content_length)))
                     res = h11.Response(status_code=send_status, headers=send_headers)
                     await wrapper.send(res)
+                    headers_sent = True
                 await wrapper.send(h11.Data(data=body))
             elif evt['type'] == 'http.disconnect':
                 pass
