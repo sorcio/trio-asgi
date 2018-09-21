@@ -2,15 +2,22 @@
 # Derived from work by Nathaniel J. Smith <njs@pobox.com> and other contributors
 # https://github.com/python-hyper/h11/blob/33c5282340b61ddea0dc00a16b6582170d822d81/examples/trio-server.py
 
-from itertools import count
 import logging
+from itertools import count
+from urllib.parse import unquote
 from wsgiref.handlers import format_date_time
 
 import trio
 import h11
 
+
 MAX_RECV = 2 ** 16
 TIMEOUT = 10
+
+VALID_STATES = {h11.CLIENT: h11.IDLE, h11.SERVER: h11.IDLE}
+
+logger = logging.getLogger('trio_web')
+
 
 ################################################################
 # I/O adapter: h11 <-> trio
@@ -39,7 +46,7 @@ class TrioHTTPWrapper:
         # The code below doesn't send ConnectionClosed, so we don't bother
         # handling it here either -- it would require that we do something
         # appropriate when 'data' is None.
-        assert type(event) is not h11.ConnectionClosed
+        assert type(event) is not h11.ConnectionClosed, "Did not expect closed connection"
         data = self.conn.send(event)
         await self.stream.send_all(data)
 
@@ -103,15 +110,17 @@ class TrioHTTPWrapper:
         # HTTP requires these headers in all responses (client would do
         # something different here)
         return [
-            ("Date", format_date_time(None).encode("ascii")),
-            ("Server", self.ident),
+            (b"date", format_date_time(None).encode("ascii")),
+            (b"server", self.ident),
         ]
 
     def info(self, *args):
         # Little debugging method
-        logging.debug("{}: {}".format(self._obj_id,
-            ' '.join('%s' for i in range(len(args)))), *args)
-
+        logger.info("{}: {}".format(self._obj_id, ' '.join([str(x) for x in args])))
+    
+    def warning(self, *args):
+        # Little debugging method
+        logger.warning("{}: {}".format(self._obj_id, ' '.join([str(x) for x in args])))
 
 ################################################################
 # Server main loop
@@ -145,8 +154,7 @@ class TrioHTTPWrapper:
 async def http_serve(request_handler, sock):
     wrapper = TrioHTTPWrapper(sock)
     while True:
-        assert wrapper.conn.states == {
-            h11.CLIENT: h11.IDLE, h11.SERVER: h11.IDLE}
+        assert wrapper.conn.states == VALID_STATES, "Invalid connection state"
 
         try:
             with trio.move_on_after(TIMEOUT):
@@ -156,11 +164,11 @@ async def http_serve(request_handler, sock):
                 if type(event) is h11.Request:
                     await request_handler(wrapper, event)
         except Exception as exc:
-            wrapper.info("Error during response handler:", exc)
+            wrapper.warning("Error during response handler:", exc)
             await maybe_send_error_response(wrapper, exc)
 
         if wrapper.conn.our_state is h11.MUST_CLOSE:
-            wrapper.info("connection is not reusable, so shutting down")
+            wrapper.warning("connection is not reusable, so shutting down")
             await wrapper.shutdown_and_clean_up()
             return
         else:
@@ -172,7 +180,7 @@ async def http_serve(request_handler, sock):
                 return
             except h11.ProtocolError:
                 states = wrapper.conn.states
-                wrapper.info("unexpected state", states, "-- bailing out")
+                wrapper.warning("unexpected state", states, "-- bailing out")
                 await maybe_send_error_response(
                     wrapper,
                     RuntimeError("unexpected state {}".format(states)))
@@ -186,13 +194,14 @@ async def http_serve(request_handler, sock):
 
 async def h11_serve_asgi(application, sock):
     async def request_adapter(wrapper, event):
+        path, _, query_string = event.target.partition(b'?')
         scope = {
             'type': 'http',
             'http_version': '1.1',
             'method': event.method.decode('ascii').upper(),
             'scheme': 'http',
-            'path': event.target.decode('utf-8'),
-            'query_string': b'',
+            'path': unquote(path.decode('ascii')),
+            'query_string': query_string,
             'root_path': '',
             'headers': event.headers,
             # 'client': None,
@@ -201,6 +210,7 @@ async def h11_serve_asgi(application, sock):
         application_instance = application(scope)
         request_received = False
         send_headers = wrapper.basic_headers()
+        header_keys = set()
         send_status = None
         headers_sent = False
         chunked = False
@@ -230,16 +240,21 @@ async def h11_serve_asgi(application, sock):
             if evt['type'] == 'http.response.start':
                 nonlocal send_status
                 send_status = evt['status']
+                for k, v in evt['headers']:
+                    assert isinstance(k, bytes), "headers keys must be bytes"
+                    assert isinstance(v, bytes), "header values must be bytes"
                 send_headers.extend(evt['headers'])
+                header_keys.update([k[0] for k in send_headers])
             elif evt['type'] == 'http.response.body':
                 nonlocal headers_sent, chunked
                 body = evt.get('body', b'')
                 more_body = evt.get('more_body', False)
                 chunked |= more_body
                 if not headers_sent:
-                    content_length = len(body)
-                    if not chunked:
-                        send_headers.append(('content-length', str(content_length)))
+                    # todo: we could behave better here, e.g. like 
+                    # https://github.com/encode/uvicorn/blob/master/docs/server-behavior.md
+                    if not chunked and b'content-length' not in header_keys:
+                        send_headers.append((b'content-length', str(len(body)).encode()))
                     res = h11.Response(status_code=send_status, headers=send_headers)
                     await wrapper.send(res)
                     headers_sent = True
@@ -263,8 +278,8 @@ async def send_simple_response(wrapper, status_code, content_type, body):
     wrapper.info("Sending", status_code,
                  "response with", len(body), "bytes")
     headers = wrapper.basic_headers()
-    headers.append(("Content-Type", content_type))
-    headers.append(("Content-Length", str(len(body))))
+    headers.append((b"content-type", content_type.encode()))
+    headers.append((b"content-length", str(len(body)).encode()))
     res = h11.Response(status_code=status_code, headers=headers)
     await wrapper.send(res)
     await wrapper.send(h11.Data(data=body))
@@ -289,4 +304,4 @@ async def maybe_send_error_response(wrapper, exc):
                                    "text/plain; charset=utf-8",
                                    body)
     except Exception as exc:
-        wrapper.info("error while sending error response:", exc)
+        wrapper.warning("error while sending error response:", exc)
