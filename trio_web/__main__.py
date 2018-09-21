@@ -10,9 +10,7 @@ from pathlib import Path
 from importlib import import_module
 from typing import List, Optional
 
-import trio
-
-from trio_web import serve_tcp as serve_http
+from trio_web import run
 
 
 class NoAppException(Exception):
@@ -69,10 +67,8 @@ def main(sys_args: Optional[List[str]]=None) -> None:
     args = parser.parse_args(sys_args or sys.argv[1:])
     application = _load_application(args.application)
     
-    print("Running on http://{}:{} (CTRL + C to quit)".format(args.host, args.port))
+    run(application, host=args.host, port=args.port)
 
-
-    trio.run(serve_http, application, args.host, int(args.port))
 
 if __name__ == '__main__':
     main()
